@@ -1,0 +1,156 @@
+# Automatically cherry-pick merged PRs onto their release-candidate branch.
+#
+# When a PR is squash-merged into develop with a milestone "Frontend X.Y.Z"
+# (or "X.Y.Z") and a branch "X.Y.Z-rc" exists, the squash commit is
+# cherry-picked and pushed directly to that rc branch. Runs on merge and on
+# milestone assignment (covers milestones added after merge). On conflict the
+# run aborts, fails, and comments on the PR with manual instructions.
+#
+# pull_request_target is safe here: the workflow definition always comes from
+# develop, and no PR-controlled code is checked out or executed — we only
+# cherry-pick a commit that a maintainer already merged into develop.
+name: Cherry-pick to release candidate
+
+on:
+  pull_request_target:
+    types: [closed, milestoned]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to (re)cherry-pick to its milestone's rc branch"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cherry-pick:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'develop' &&
+       github.event.pull_request.milestone != null)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR, milestone version, and rc branch
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            PR="$INPUT_PR"
+          else
+            PR="$EVENT_PR"
+          fi
+          PR_JSON=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          MERGED=$(jq -r '.merged' <<<"$PR_JSON")
+          BASE=$(jq -r '.base.ref' <<<"$PR_JSON")
+          MILESTONE=$(jq -r '.milestone.title // empty' <<<"$PR_JSON")
+          MERGE_SHA=$(jq -r '.merge_commit_sha // empty' <<<"$PR_JSON")
+          AUTHOR=$(jq -r '.user.login' <<<"$PR_JSON")
+          if [ "$MERGED" != "true" ] || [ "$BASE" != "develop" ] || [ -z "$MILESTONE" ]; then
+            echo "PR #$PR is not a merged develop PR with a milestone (merged=$MERGED base=$BASE milestone='$MILESTONE'); nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$MILESTONE" | head -1 || true)
+          if [ -z "$VERSION" ]; then
+            echo "Milestone '$MILESTONE' has no X.Y.Z version; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RC_BRANCH="${VERSION}-rc"
+          if ! gh api "repos/$GITHUB_REPOSITORY/branches/$RC_BRANCH" --silent 2>/dev/null; then
+            echo "Branch $RC_BRANCH does not exist; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "PR #$PR ($MERGE_SHA) -> $RC_BRANCH"
+          {
+            echo "skip=false"
+            echo "pr=$PR"
+            echo "rc_branch=$RC_BRANCH"
+            echo "merge_sha=$MERGE_SHA"
+            echo "author=$AUTHOR"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out rc branch
+        if: steps.resolve.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.rc_branch }}
+          fetch-depth: 0
+
+      - name: Cherry-pick and push
+        if: steps.resolve.outputs.skip == 'false'
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          RC_BRANCH: ${{ steps.resolve.outputs.rc_branch }}
+          MERGE_SHA: ${{ steps.resolve.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Retry instead of a concurrency group: GitHub keeps at most one
+          # queued run per group, which would silently drop cherry-picks when
+          # several PRs merge in quick succession.
+          for attempt in 1 2 3; do
+            git fetch origin "$RC_BRANCH"
+            git reset --hard "origin/$RC_BRANCH"
+            if git log --oneline | grep -qF "(#${PR})"; then
+              echo "PR #$PR is already on $RC_BRANCH; nothing to do."
+              echo "picked=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! git cherry-pick -x "$MERGE_SHA"; then
+              git cherry-pick --abort || true
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            if git push origin "HEAD:$RC_BRANCH"; then
+              echo "picked=true" >> "$GITHUB_OUTPUT"
+              echo "new_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Push attempt $attempt rejected (rc branch moved); retrying."
+          done
+          echo "Failed to push to $RC_BRANCH after 3 attempts."
+          exit 1
+
+      - name: Comment on PR (success)
+        if: steps.pick.outputs.picked == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          RC_BRANCH: ${{ steps.resolve.outputs.rc_branch }}
+          NEW_SHA: ${{ steps.pick.outputs.new_sha }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+            "Cherry-picked to \`$RC_BRANCH\` as $NEW_SHA."
+
+      - name: Comment on PR (conflict)
+        if: failure() && steps.pick.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          RC_BRANCH: ${{ steps.resolve.outputs.rc_branch }}
+          MERGE_SHA: ${{ steps.resolve.outputs.merge_sha }}
+          AUTHOR: ${{ steps.resolve.outputs.author }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+            "@$AUTHOR automatic cherry-pick to \`$RC_BRANCH\` failed due to conflicts. Please cherry-pick manually:
+
+          \`\`\`bash
+          git fetch origin $RC_BRANCH
+          git checkout -b cherry-pick-$PR-to-$RC_BRANCH origin/$RC_BRANCH
+          git cherry-pick -x $MERGE_SHA
+          # resolve conflicts, then open a PR targeting $RC_BRANCH
+          \`\`\`
+          [Workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
