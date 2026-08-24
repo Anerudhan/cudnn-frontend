@@ -104,7 +104,12 @@ jobs:
           for attempt in 1 2 3; do
             git fetch origin "$RC_BRANCH"
             git reset --hard "origin/$RC_BRANCH"
-            if git log --oneline | grep -qF "(#${PR})"; then
+            # Already picked if a commit carries the "cherry picked from" trailer
+            # (written by our own cherry-pick -x, or a playbook-style manual pick)
+            # or a squash subject ending in "(#N)". Subject alone is not enough:
+            # with COMMIT_OR_PR_TITLE squash titles, single-commit PRs may lack it.
+            if [ -n "$(git log --fixed-strings --grep "(cherry picked from commit $MERGE_SHA)" -n 1 --format=%H)" ] \
+               || git log --format=%s | grep -qE "\(#${PR}\)$"; then
               echo "PR #$PR is already on $RC_BRANCH; nothing to do."
               echo "picked=false" >> "$GITHUB_OUTPUT"
               exit 0
