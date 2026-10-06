@@ -286,3 +286,31 @@ def test_additive_forward_contracts(dim, value_dim, head_counts, safe_gate, chec
         actual = actual[:2] + (actual[2][:valid_rows],)
         expected = expected[:2] + (expected[2][:valid_rows],)
     assert_matches(actual, expected)
+
+
+@pytest.mark.parametrize("epsilon", [None, 1e-6])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_workspace_rejects_host_storage_before_launch(epsilon, ordered, cudnn_handle, monkeypatch):
+    values = make_inputs(512, heads=2)
+    graph, pack, output, state = graph_for(values, epsilon)
+    build_and_pin(graph, "kda_frost")
+    workspace = torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+    kwargs = {"handle": cudnn_handle}
+    if ordered:
+        kwargs["tensor_uids"] = [tensor.uid for tensor in pack]
+        pack = tuple(pack.values())
+    graph.execute(pack, workspace, **kwargs)
+    expected = (output.clone(), state.clone())
+    graph.execute(pack, workspace.data_ptr(), **kwargs)
+    torch.cuda.synchronize()
+    assert_matches((output, state), expected, tolerance=1e-6)
+    plan = graph._compiled_plans[graph._plan_index].compiled
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("host workspace reached the compiled launch")
+
+    monkeypatch.setattr(plan, "run", forbidden)
+    host = torch.empty(workspace.numel(), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="CUDA|cuda|device"):
+        graph.execute(pack, host, **kwargs)
